@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from collections import Counter
 import logging
+import asyncio
 
 load_dotenv(override=True)
 
@@ -22,14 +23,45 @@ HEADERS : dict[str, str] = {
     "X-Discord-Key": KEY
 }
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+
+logger = logging.getLogger("discord_bot")
+
+discord_send_lock = asyncio.Semaphore(1)
+
+session = aiohttp.ClientSession()
+
+async def api_get(endpoint: str) -> Any | None:
+    try:
+        async with session.get(
+            endpoint,
+            headers=HEADERS,
+            proxy="http://proxy.server:3128",
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as response:
+            if response.status != 200:
+                logger.error("API error %s: %s", response.status, await response.text())
+                return None
+            return await response.json()
+
+    except aiohttp.ClientError as e:
+        logger.exception("API connection error: %s", e)
+        return None
+
+    except Exception:
+        logger.exception("Unknown API error")
+        return None
 
 async def load_filenames() -> None:
     global filenames
-    async with aiohttp.ClientSession() as session:
-        async with session.get(f"{URL}/files", headers=HEADERS, proxy="http://proxy.server:3128") as response:
-            data = await response.json()
-            filenames = list(data)
+    data = await api_get(f"{URL}/files")
+    if data is None:
+        logger.warning("Failed to load filenames")
+        return
+    filenames = list(data)
 
 
 def parse_datetime(value: str | datetime.datetime) -> datetime.datetime:
@@ -140,30 +172,19 @@ def create_overview_embed(files: dict[str, Any]) -> Embed:
     return embed
 
 
-async def send_file_message(interaction: Interaction, data : dict[str, str | bool | datetime.datetime], file : str) -> None:
-    
-    embed = Embed(title=f"📄 Статус файла {Path(file).name}")
-    embed.add_field(
-        name="Завершён?",
-        value="✅ Да" if data["finished"] else "❌ Нет",
-        inline=True
-    )
-    embed.add_field(
-        name="Последний обновивший",
-        value=data["uploaded_by"],
-        inline=True
-    )
-    uploaded_at = datetime.datetime.fromisoformat(str(data["uploaded_at"]).replace("Z", "+00:00"))
-    embed.add_field(
-        name="Последнее обновление",
-        value=uploaded_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        inline=False
-    )
-    await interaction.followup.send(embed=embed)
+async def send_file_message(interaction: Interaction, data: dict[str, Any], file: str) -> None:
+    try:
+        embed = Embed(title=f"📄 Статус файла {Path(file).name}")
+        embed.add_field(
+            name="Завершён?",
+            value="✅ Да" if data["finished"] else "❌ Нет"
+        )
+        await safe_send_embed(interaction, embed)
+    except Exception:
+        logger.exception("send_file_message failed")
 
 
 class MyBot(Client):
-
     def __init__(self) -> None:
         intents = discord.Intents.default()
         super().__init__(intents=intents, proxy="http://proxy.server:3128")
@@ -176,36 +197,88 @@ bot = MyBot()
 
 @bot.event
 async def on_ready() -> None:
-    await load_filenames()
+    try:
+        await load_filenames()
+    except Exception:
+        logger.exception("on_ready failed")
+
+@bot.tree.error
+async def on_app_command_error(interaction: Interaction, error: discord.app_commands.AppCommandError) -> None:
+
+    logger.exception("Command error", exc_info=error)
+    try:
+        message = "⚠️ Произошла ошибка. Администратор уведомлён."
+        if interaction.response.is_done():
+            await interaction.followup.send(message)
+        else:
+            await interaction.response.send_message(message)
+    except Exception:
+        logger.exception("Failed to send error message")
 
 
 @bot.tree.command(name="status", description="Статус перевода")
-
 @discord.app_commands.describe(filename="Имя файла для проверки")
 
-async def status(interaction: Interaction, filename : str | None = None) -> None:
-    if filename is None:
-        endpoint = f"{URL}/statuses"
-    else:
-        endpoint = f"{URL}/status/{filename}"
+async def status(interaction: Interaction, filename: str | None = None) -> None:
     await interaction.response.defer()
-    async with aiohttp.ClientSession() as session:
-        async with session.get(endpoint, headers=HEADERS, proxy="http://proxy.server:3128") as response:
-            data = await response.json()
-    if filename is None:
-        await interaction.followup.send(embed=create_overview_embed(data))
-        await interaction.followup.send(embed=create_users_embed(data))
-        for embed in create_file_embeds(data):
-            await interaction.followup.send(embed=embed)
-    else:
-        await send_file_message(interaction, data, filename)
+    try:
+        if filename is None:
+            endpoint = f"{URL}/statuses"
+        else:
+            endpoint = f"{URL}/status/{filename}"
+        data = await api_get(endpoint)
+        if data is None:
+            await interaction.followup.send("❌ Сервер переводов недоступен")
+            return
+        if filename is None:
+            await safe_send_embed(interaction, create_overview_embed(data))
+            await safe_send_embed(interaction, create_users_embed(data))
+            for embed in create_file_embeds(data):
+                await safe_followup_send(interaction, embed=embed)
+                await asyncio.sleep(1)
+        else:
+            await send_file_message(interaction, data, filename)
+    except Exception:
+        logger.exception("/status failed")
+        try:
+            await interaction.followup.send("❌ Ошибка обработки статуса")
+        except Exception:
+            pass
+
+
+async def safe_send_embed(interaction: Interaction, embed: Embed) -> None:
+    try:
+        await interaction.followup.send(embed=embed)
+    except discord.HTTPException as ex:
+        logger.warning("Discord refused message")
+        logger.error(ex)
+    except Exception:
+        logger.exception("Discord send failed")
+
 
 @status.autocomplete("filename")
 async def filename_autocomplete(interaction: Interaction, current: str) -> list[Choice[str]]:
-    return [
-        Choice(name=file, value=file)
-        for file in filenames
-        if current.lower() in file.lower()
-    ][:25]
+    try:
+        return [
+            Choice(name=file, value=file)
+            for file in filenames
+            if current.lower() in file.lower()
+        ][:25]
+    except Exception:
+        logger.exception("Autocomplete failed")
+        return []
+    
+
+async def safe_followup_send(interaction: Interaction, *, embed: Embed | None = None, content: str | None = None) -> None:
+    async with discord_send_lock:
+        try:
+            if embed != None:
+                await interaction.followup.send(embed=embed)
+            elif content != None:
+                await interaction.followup.send(content=content)
+        except discord.HTTPException as e:
+            logger.exception("Discord send failed: %s", e)
+        except Exception:
+            logger.exception("Unknown Discord send error")
 
 bot.run(TOKEN)

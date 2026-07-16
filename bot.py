@@ -249,9 +249,9 @@ async def status(interaction: Interaction, filename: str | None = None) -> None:
         if filename is None:
             await safe_send_embed(interaction, create_overview_embed(data))
             await safe_send_embed(interaction, create_users_embed(data))
-            for embed in create_file_embeds(data):
-                await safe_followup_send(interaction, embed=embed)
-                await asyncio.sleep(1)
+            # for embed in create_file_embeds(data):
+            #     await safe_followup_send(interaction, embed=embed)
+            #     await asyncio.sleep(1)
         else:
             await send_file_message(interaction, data, filename)
     except Exception:

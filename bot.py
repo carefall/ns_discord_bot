@@ -32,7 +32,7 @@ logger = logging.getLogger("discord_bot")
 
 discord_send_lock = asyncio.Semaphore(1)
 
-session = aiohttp.ClientSession()
+session : aiohttp.ClientSession
 
 async def api_get(endpoint: str) -> Any | None:
     try:
@@ -179,6 +179,17 @@ async def send_file_message(interaction: Interaction, data: dict[str, Any], file
             name="Завершён?",
             value="✅ Да" if data["finished"] else "❌ Нет"
         )
+        embed.add_field(
+        name="Последний обновивший",
+        value=data["uploaded_by"],
+        inline=True
+        )
+        uploaded_at = datetime.datetime.fromisoformat(str(data["uploaded_at"]).replace("Z", "+00:00"))
+        embed.add_field(
+            name="Последнее обновление",
+            value=uploaded_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            inline=False
+        )
         await safe_send_embed(interaction, embed)
     except Exception:
         logger.exception("send_file_message failed")
@@ -198,6 +209,8 @@ bot = MyBot()
 @bot.event
 async def on_ready() -> None:
     try:
+        global session
+        session = aiohttp.ClientSession()
         await load_filenames()
     except Exception:
         logger.exception("on_ready failed")
@@ -215,6 +228,9 @@ async def on_app_command_error(interaction: Interaction, error: discord.app_comm
     except Exception:
         logger.exception("Failed to send error message")
 
+@bot.tree.command(name="ping")
+async def ping(interaction: Interaction) -> None:
+    await interaction.response.send_message("pong")
 
 @bot.tree.command(name="status", description="Статус перевода")
 @discord.app_commands.describe(filename="Имя файла для проверки")

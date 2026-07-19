@@ -7,7 +7,6 @@ import aiohttp
 import datetime
 from pathlib import Path
 from typing import Any
-from collections import Counter
 import logging
 import asyncio
 
@@ -15,7 +14,7 @@ load_dotenv(override=True)
 
 TOKEN : str = os.getenv('DISCORD_TOKEN', '')
 KEY : str = os.getenv('DISCORD_KEY', '')
-URL : str = os.getenv('DJANGO_API_URL', 'http://127.0.0.1:8000/translator/discord')
+URL : str = os.getenv('DJANGO_API_URL', 'http://127.0.0.1:8000/analytics')
 
 filenames : list[str]= []
 
@@ -39,7 +38,6 @@ async def api_get(endpoint: str) -> Any | None:
         async with session.get(
             endpoint,
             headers=HEADERS,
-            proxy="http://proxy.server:3128",
             timeout=aiohttp.ClientTimeout(total=10)
         ) as response:
             if response.status != 200:
@@ -70,124 +68,100 @@ def parse_datetime(value: str | datetime.datetime) -> datetime.datetime:
     return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def create_file_embeds(files: dict[str, Any]) -> list[Embed]:
-    embeds : list[Embed] = []
-    sorted_files = sorted(
-        files.items(),
-        key=lambda item: (
-            item[1]["finished"],
-            -parse_datetime(item[1]["uploaded_at"]).timestamp(),
-            item[0]
-        )
-    )
-    for i in range(0, len(sorted_files), 15):
-        chunk = sorted_files[i:i + 15]
-        embed = Embed(title=f"📁 Статусы файлов (страница {i // 15 + 1})", color=0x9B59B6)
-        for filename, data in chunk:
-            status = "✅" if data["finished"] else "❌"
-            short_name = filename.split("/")[-1]
-            embed.add_field(
-                name=f"{status} {short_name}",
-                value=(
-                    f"📂 `{filename}`\n"
-                    f"👤 {data['uploaded_by']}\n"
-                    f"🕒 {data['uploaded_at']}"
-                ),
-                inline=False
-            )
-        embeds.append(embed)
-    return embeds
-
-def create_users_embed(files: dict[str, Any]) -> Embed:
-    counter = Counter(
-        data["uploaded_by"]
-        for data in files.values()
-    )
-    embed = Embed(title="👥 Статистика пользователей",color=0x2ECC71)
-    users_count = len(
-        {
-            data["uploaded_by"]
-            for data in files.values()
-        }
+def create_users_embed(users: dict[str, int]) -> Embed:
+    embed = Embed(
+        title="👥 Статистика пользователей",
+        color=0x2ECC71
     )
     embed.add_field(
-        name='👥 Последних загрузчиков: ',
-        value=f"{users_count}",
-        inline=True
-    )
-    embed.add_field(
-        name='Статистика по последним обновлениям',
-        value='',
+        name="Последние загрузки",
+        value="",
         inline=False
     )
-    for user, count in counter.most_common(15):
+    for user, count in sorted(users.items(), key=lambda x: x[1], reverse=True)[:15]:
         embed.add_field(
-            name=f"{user} :",
+            name=user,
             value=f"{count} файлов",
             inline=True
         )
     return embed
 
-def create_overview_embed(files: dict[str, Any]) -> Embed:
-    total = len(files)
-    finished = sum(
-        1
-        for file in files.values()
-        if file["finished"]
-    )
-    percent = (finished / total * 100 if total else 0)
+def create_overview_embed(data: dict[str, Any]) -> Embed:
+    progress = data["progress"]
     bar_length = 10
-    filled = int(bar_length * percent / 100)
-    progress_bar = ("█" * filled + "░" * (bar_length - filled))
-    last_file : tuple[str, dict[str, Any]] = max(
-        files.items(),
-        key=lambda x: x[1]["uploaded_at"]
+    filled = int(bar_length * progress / 100)
+    progress_bar = "█" * filled + "░" * (bar_length - filled)
+    embed = Embed(
+        title="📊 Статистика перевода",
+        color=0x3498DB
     )
-    embed = Embed(title="📊 Отчёт", color=0x3498DB)
     embed.add_field(
-        name="Всего файлов",
-        value=str(total),
+        name="📁 Файлы",
+        value=(
+            f"Всего: **{data['files_total']}**\n"
+            f"🔒 В работе: **{data['files_finished']}**"
+        ),
         inline=True
     )
     embed.add_field(
-        name="Закончено",
-        value=str(finished),
+        name="📝 Строки",
+        value=(
+            f"Переведено: **{data['strings_translated']}**\n"
+            f"Всего: **{data['strings_total']}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="💬 Комментарии",
+        value=str(data["comments"]),
         inline=True
     )
     embed.add_field(
         name="Прогресс",
-        value=f"{progress_bar} {percent:.1f}%",
+        value=f"{progress_bar} **{progress:.2f}%**",
         inline=False
     )
-    embed.add_field(
-        name="Последний загрузивший",
-        value=last_file[1]["uploaded_by"],
-        inline=True
-    )
-    embed.add_field(
-        name="Последний файл",
-        value=f"`{last_file[0]}`",
-        inline=False
-    )
+
     return embed
 
 
 async def send_file_message(interaction: Interaction, data: dict[str, Any], file: str) -> None:
     try:
-        embed = Embed(title=f"📄 Статус файла {Path(file).name}")
-        embed.add_field(
-            name="Завершён?",
-            value="✅ Да" if data["finished"] else "❌ Нет"
+        embed = Embed(
+            title=f"📄 Статус файла {Path(file).name}",
+            color=0x3498DB
         )
         embed.add_field(
-        name="Последний обновивший",
-        value=data["uploaded_by"],
-        inline=True
+            name="Статус",
+            value="🔒 В работе" if data["finished"] else "🟢 Доступен",
+            inline=True
         )
-        uploaded_at = datetime.datetime.fromisoformat(str(data["uploaded_at"]).replace("Z", "+00:00"))
+        embed.add_field(
+            name="Прогресс",
+            value=(
+                f"{data['translated']} / {data['total']}\n"
+                f"{data['progress']:.2f}%"
+            ),
+            inline=True
+        )
+        embed.add_field(
+            name="💬 Комментарии",
+            value=str(data["comments"]),
+            inline=True
+        )
+        embed.add_field(
+            name="Последний обновивший",
+            value=data["uploaded_by"],
+            inline=True
+        )
+        uploaded_at = datetime.datetime.fromisoformat(
+            str(data["uploaded_at"]).replace("Z", "+00:00")
+        )
         embed.add_field(
             name="Последнее обновление",
-            value=uploaded_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            value=uploaded_at.strftime(
+                "%Y-%m-%d %H:%M:%S UTC"
+            ),
             inline=False
         )
         await safe_send_embed(interaction, embed)
@@ -198,11 +172,17 @@ async def send_file_message(interaction: Interaction, data: dict[str, Any], file
 class MyBot(Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
-        super().__init__(intents=intents, proxy="http://proxy.server:3128")
+        super().__init__(intents=intents)
         self.tree = CommandTree(self)
 
     async def setup_hook(self) -> None:
         await self.tree.sync()
+
+    async def close(self) -> None:
+        global session
+        if session:
+            await session.close()
+        await super().close()
 
 bot = MyBot()
 
@@ -248,10 +228,9 @@ async def status(interaction: Interaction, filename: str | None = None) -> None:
             return
         if filename is None:
             await safe_send_embed(interaction, create_overview_embed(data))
-            await safe_send_embed(interaction, create_users_embed(data))
-            # for embed in create_file_embeds(data):
-            #     await safe_followup_send(interaction, embed=embed)
-            #     await asyncio.sleep(1)
+            users = await api_get(f"{URL}/users")
+            if users is not None:
+                await safe_send_embed(interaction, create_users_embed(users))
         else:
             await send_file_message(interaction, data, filename)
     except Exception:
